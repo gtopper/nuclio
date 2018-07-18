@@ -24,7 +24,7 @@ ifeq ($(OS_NAME), Linux)
 	NUCLIO_DEFAULT_TEST_HOST := $(shell docker network inspect bridge | grep "Gateway" | grep -o '"[^"]*"$$')
 	# On EC2 we don't have gateway, use default
 	ifeq ($(NUCLIO_DEFAULT_TEST_HOST),)
-	    NUCLIO_DEFAULT_TEST_HOST := "172.17.0.1"
+		NUCLIO_DEFAULT_TEST_HOST := "172.17.0.1"
 	endif
 else
 	NUCLIO_DEFAULT_TEST_HOST := "docker.for.mac.host.internal"
@@ -60,6 +60,27 @@ GO_LINK_FLAGS_INJECT_VERSION := $(GO_LINK_FLAGS) -X github.com/nuclio/nuclio/pkg
 # inject version info as file
 NUCLIO_BUILD_ARGS_VERSION_INFO_FILE = --build-arg NUCLIO_VERSION_INFO_FILE_CONTENTS="$(NUCLIO_VERSION_INFO)"
 
+#
+#  Must be first target
+#
+all:
+	$(error Please pick a target)
+
+
+#
+# Version resources
+#
+
+helm-publish:
+	@echo Fetching branch
+	@rm -rf /tmp/nuclio-helm
+	@git clone -b gh-pages --single-branch git@github.com:nuclio/nuclio.git /tmp/nuclio-helm
+	@echo Creating package and updating index
+	@helm package -d /tmp/nuclio-helm/charts hack/k8s/helm/nuclio
+	@cd /tmp/nuclio-helm/charts && helm repo index --merge index.yaml --url https://nuclio.github.io/nuclio/charts/ .
+	@echo Publishing
+	@cd /tmp/nuclio-helm/charts && git add --all && git commit && git push origin
+	@echo Done
 
 #
 # Build helpers
@@ -75,7 +96,7 @@ GO_BUILD_TOOL = docker run \
 	--workdir $(GO_BUILD_TOOL_WORKDIR) \
 	--env GOOS=$(NUCLIO_OS) \
 	--env GOARCH=$(NUCLIO_ARCH) \
-	golang:1.9.2 \
+	golang:1.10 \
 	go build -a \
 	-installsuffix cgo \
 	-ldflags="$(GO_LINK_FLAGS_INJECT_VERSION)"
@@ -88,15 +109,15 @@ build: docker-images tools
 	@echo Done.
 
 DOCKER_IMAGES_RULES = \
-    controller \
-    playground \
-    dashboard \
-    processor \
-    handler-builder-golang-onbuild \
-    handler-builder-java-onbuild \
-    handler-builder-python-onbuild \
-    handler-builder-dotnetcore-onbuild \
-    handler-builder-nodejs-onbuild
+	controller \
+	dashboard \
+	processor \
+	handler-builder-golang-onbuild \
+	handler-builder-java-onbuild \
+	handler-builder-ruby-onbuild \
+	handler-builder-python-onbuild \
+	handler-builder-dotnetcore-onbuild \
+	handler-builder-nodejs-onbuild
 
 docker-images: ensure-gopath $(DOCKER_IMAGES_RULES)
 	@echo Done.
@@ -130,6 +151,8 @@ nuctl: ensure-gopath
 processor: ensure-gopath
 	docker build --file cmd/processor/Dockerfile --tag nuclio/processor:$(NUCLIO_DOCKER_IMAGE_TAG) .
 
+IMAGES_TO_PUSH += nuclio/processor:$(NUCLIO_DOCKER_IMAGE_TAG)
+
 #
 # Dockerized services
 #
@@ -144,17 +167,6 @@ controller: ensure-gopath
 		$(NUCLIO_DOCKER_LABELS) .
 
 IMAGES_TO_PUSH += $(NUCLIO_DOCKER_CONTROLLER_IMAGE_NAME)
-
-# Playground
-NUCLIO_DOCKER_PLAYGROUND_IMAGE_NAME=nuclio/playground:$(NUCLIO_DOCKER_IMAGE_TAG)
-
-playground: ensure-gopath
-	docker build $(NUCLIO_BUILD_ARGS_VERSION_INFO_FILE) \
-		--file cmd/playground/Dockerfile \
-		--tag $(NUCLIO_DOCKER_PLAYGROUND_IMAGE_NAME) \
-		$(NUCLIO_DOCKER_LABELS) .
-
-IMAGES_TO_PUSH += $(NUCLIO_DOCKER_PLAYGROUND_IMAGE_NAME)
 
 # Dashboard
 NUCLIO_DOCKER_DASHBOARD_IMAGE_NAME=nuclio/dashboard:$(NUCLIO_DOCKER_IMAGE_TAG)
@@ -199,7 +211,7 @@ handler-builder-golang-onbuild:
 		--tag $(NUCLIO_DOCKER_HANDLER_BUILDER_GOLANG_ONBUILD_ALPINE_IMAGE_NAME) .
 
 IMAGES_TO_PUSH += $(NUCLIO_DOCKER_HANDLER_BUILDER_GOLANG_ONBUILD_IMAGE_NAME) \
-    $(NUCLIO_DOCKER_HANDLER_BUILDER_GOLANG_ONBUILD_ALPINE_IMAGE_NAME)
+	$(NUCLIO_DOCKER_HANDLER_BUILDER_GOLANG_ONBUILD_ALPINE_IMAGE_NAME)
 
 # Pypy
 NUCLIO_DOCKER_PROCESSOR_PYPY_JESSIE_IMAGE_NAME=nuclio/processor-pypy2-5.9-jessie:$(NUCLIO_DOCKER_IMAGE_TAG)
@@ -233,6 +245,18 @@ handler-builder-nodejs-onbuild:
 		--tag $(NUCLIO_DOCKER_HANDLER_BUILDER_NODEJS_ONBUILD_IMAGE_NAME) .
 
 IMAGES_TO_PUSH += $(NUCLIO_DOCKER_HANDLER_BUILDER_NODEJS_ONBUILD_IMAGE_NAME)
+
+# Ruby
+NUCLIO_DOCKER_HANDLER_BUILDER_RUBY_ONBUILD_IMAGE_NAME=\
+nuclio/handler-builder-ruby-onbuild:$(NUCLIO_DOCKER_IMAGE_TAG)
+
+handler-builder-ruby-onbuild:
+	docker build --build-arg NUCLIO_ARCH=$(NUCLIO_ARCH) --build-arg NUCLIO_LABEL=$(NUCLIO_LABEL) \
+		--file pkg/processor/build/runtime/ruby/docker/onbuild/Dockerfile \
+		--tag $(NUCLIO_DOCKER_HANDLER_BUILDER_RUBY_ONBUILD_IMAGE_NAME) .
+
+IMAGES_TO_PUSH += $(NUCLIO_DOCKER_HANDLER_BUILDER_RUBY_ONBUILD_IMAGE_NAME)
+
 
 # dotnet core
 NUCLIO_DOCKER_HANDLER_BUILDER_DOTNETCORE_ONBUILD_IMAGE_NAME=nuclio/handler-builder-dotnetcore-onbuild:$(NUCLIO_DOCKER_IMAGE_TAG)
@@ -268,11 +292,11 @@ lint: ensure-gopath
 
 	@echo Verifying imports...
 	$(GOPATH)/bin/impi \
-        --local github.com/nuclio/nuclio/ \
-        --scheme stdLocalThirdParty \
-        --skip pkg/platform/kube/apis \
-        --skip pkg/platform/kube/client \
-        ./cmd/... ./pkg/...
+		--local github.com/nuclio/nuclio/ \
+		--scheme stdLocalThirdParty \
+		--skip pkg/platform/kube/apis \
+		--skip pkg/platform/kube/client \
+		./cmd/... ./pkg/...
 
 	@echo Linting...
 	@$(GOPATH)/bin/gometalinter.v2 \

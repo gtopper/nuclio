@@ -171,10 +171,10 @@ func (mp *mockPlatform) GetExternalIPAddresses() ([]string, error) {
 	return args.Get(0).([]string), args.Error(1)
 }
 
-// GetDeployRequiresRegistry returns true if a registry is required for deploy, false otherwise
-func (mp *mockPlatform) GetDeployRequiresRegistry() bool {
+// GetHealthCheckMode returns the healthcheck mode the platform requires
+func (mp *mockPlatform) GetHealthCheckMode() platform.HealthCheckMode {
 	args := mp.Called()
-	return args.Bool(0)
+	return args.Get(0).(platform.HealthCheckMode)
 }
 
 // GetName returns the platform name
@@ -187,6 +187,12 @@ func (mp *mockPlatform) GetName() string {
 func (mp *mockPlatform) GetNodes() ([]platform.Node, error) {
 	args := mp.Called()
 	return args.Get(0).([]platform.Node), args.Error(1)
+}
+
+// ResolveDefaultNamespace returns the proper default resource namespace, given the current default namespace
+func (mp *mockPlatform) ResolveDefaultNamespace(defaultNamespace string) string {
+	args := mp.Called()
+	return args.Get(0).(string)
 }
 
 //
@@ -217,7 +223,8 @@ func (suite *dashboardTestSuite) SetupTest() {
 		true,
 		&platformconfig.WebServer{Enabled: &trueValue},
 		nil,
-		nil)
+		nil,
+		"")
 
 	if err != nil {
 		panic("Failed to create server")

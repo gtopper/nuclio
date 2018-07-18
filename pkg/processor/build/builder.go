@@ -17,8 +17,10 @@ limitations under the License.
 package build
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -40,15 +42,19 @@ import (
 	_ "github.com/nuclio/nuclio/pkg/processor/build/runtime/nodejs"
 	//_ "github.com/nuclio/nuclio/pkg/processor/build/runtime/pypy"
 	_ "github.com/nuclio/nuclio/pkg/processor/build/runtime/python"
+	_ "github.com/nuclio/nuclio/pkg/processor/build/runtime/ruby"
 	_ "github.com/nuclio/nuclio/pkg/processor/build/runtime/shell"
 	"github.com/nuclio/nuclio/pkg/processor/build/util"
+	"github.com/nuclio/nuclio/pkg/version"
 
 	"github.com/nuclio/logger"
+	"github.com/rs/xid"
 	"gopkg.in/yaml.v2"
 )
 
 const (
 	functionConfigFileName = "function.yaml"
+	uhttpcImage            = "nuclio/uhttpc:0.0.1-amd64"
 )
 
 // holds parameters for things that are required before a runtime can be initialized
@@ -61,10 +67,11 @@ type runtimeInfo struct {
 	weight int
 }
 
+// Builder builds user handlers
 type Builder struct {
 	logger logger.Logger
 
-	platform *platform.Platform
+	platform platform.Platform
 
 	options *platform.CreateFunctionBuildOptions
 
@@ -100,9 +107,13 @@ type Builder struct {
 
 	// a map of support runtimes
 	runtimeInfo map[string]runtimeInfo
+
+	// original function configuration, for fields that are overridden and need to be restored
+	originalFunctionConfig functionconfig.Config
 }
 
-func NewBuilder(parentLogger logger.Logger, platform *platform.Platform) (*Builder, error) {
+// NewBuilder returns a new builder
+func NewBuilder(parentLogger logger.Logger, platform platform.Platform) (*Builder, error) {
 	var err error
 
 	newBuilder := &Builder{
@@ -120,12 +131,22 @@ func NewBuilder(parentLogger logger.Logger, platform *platform.Platform) (*Build
 	return newBuilder, nil
 }
 
+// Build builds the handler
 func (b *Builder) Build(options *platform.CreateFunctionBuildOptions) (*platform.CreateFunctionBuildResult, error) {
 	var err error
 
 	b.options = options
 
 	b.logger.InfoWith("Building", "name", b.options.FunctionConfig.Meta.Name)
+
+	configurationRead := false
+	if common.IsFile(b.providedFunctionConfigFilePath()) {
+		b.logger.InfoWith("Reading user provided configuration", "path", b.providedFunctionConfigFilePath())
+		if _, err := b.readConfiguration(); err != nil {
+			return nil, errors.Wrap(err, "Failed to read configuration")
+		}
+		configurationRead = true
+	}
 
 	// create base temp directory
 	err = b.createTempDir()
@@ -141,32 +162,41 @@ func (b *Builder) Build(options *platform.CreateFunctionBuildOptions) (*platform
 		return nil, errors.Wrap(err, "Failed to create staging dir")
 	}
 
-	if b.options.FunctionConfig.Spec.Build.FunctionSourceCode != "" {
+	// before we resolve the path, save it so that we can restore it later
+	b.originalFunctionConfig.Spec.Build.Path = b.options.FunctionConfig.Spec.Build.Path
 
-		// if user gave function as source code rather than a path - write it to a temporary file
-		b.options.FunctionConfig.Spec.Build.Path, err = b.writeFunctionSourceCodeToTempFile(b.options.FunctionConfig.Spec.Build.FunctionSourceCode)
-		if err != nil {
-			return nil, errors.Wrap(err, "Failed to save function code to temporary file")
-		}
-	} else {
-
-		// resolve the function path - download in case its a URL
-		b.options.FunctionConfig.Spec.Build.Path, err = b.resolveFunctionPath(b.options.FunctionConfig.Spec.Build.Path)
-		if err != nil {
-			return nil, errors.Wrap(err, "Failed to resolve function path")
-		}
+	// resolve the function path - download in case its a URL
+	b.options.FunctionConfig.Spec.Build.Path, err = b.resolveFunctionPath(b.options.FunctionConfig.Spec.Build.Path)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to resolve function path")
 	}
 
 	// parse the inline blocks in the file - blocks of comments starting with @nuclio.<something>. this may be used
 	// later on (e.g. for creating files)
 	if common.IsFile(b.options.FunctionConfig.Spec.Build.Path) {
+		var functionSourceCode string
+
+		// see if there are any inline blocks in the code
 		b.parseInlineBlocks() // nolint: errcheck
+
+		// try to see if we need to convert the file path -> functionSourceCode
+		functionSourceCode, err = b.getSourceCodeFromFilePath()
+		if err != nil {
+			b.logger.DebugWith("Not populating function source code", "reason", errors.Cause(err))
+		} else {
+
+			// set into source code
+			b.logger.DebugWith("Populating functionSourceCode from file path", "contents", functionSourceCode)
+			b.options.FunctionConfig.Spec.Build.FunctionSourceCode = base64.StdEncoding.EncodeToString([]byte(functionSourceCode))
+		}
 	}
 
 	// prepare configuration from both configuration files and things builder infers
-	_, err = b.readConfiguration()
-	if err != nil {
-		return nil, errors.Wrap(err, "Failed to read configuration")
+	if !configurationRead {
+		_, err = b.readConfiguration()
+		if err != nil {
+			return nil, errors.Wrap(err, "Failed to read configuration")
+		}
 	}
 
 	// create a runtime based on the configuration
@@ -181,9 +211,13 @@ func (b *Builder) Build(options *platform.CreateFunctionBuildOptions) (*platform
 		return nil, errors.Wrap(err, "Failed to enrich configuration")
 	}
 
+	// copy the configuration we enriched, restoring any fields that should not be leaked externally
+	enrichedConfiguration := b.options.FunctionConfig
+	enrichedConfiguration.Spec.Build.Path = b.originalFunctionConfig.Spec.Build.Path
+
 	// if a callback is registered, call back
 	if b.options.OnAfterConfigUpdate != nil {
-		if err = b.options.OnAfterConfigUpdate(&b.options.FunctionConfig); err != nil {
+		if err = b.options.OnAfterConfigUpdate(&enrichedConfiguration); err != nil {
 			return nil, errors.Wrap(err, "OnAfterConfigUpdate returned error")
 		}
 	}
@@ -206,7 +240,7 @@ func (b *Builder) Build(options *platform.CreateFunctionBuildOptions) (*platform
 
 	buildResult := &platform.CreateFunctionBuildResult{
 		Image: processorImage,
-		UpdatedFunctionConfig: b.options.FunctionConfig,
+		UpdatedFunctionConfig: enrichedConfiguration,
 	}
 
 	b.logger.InfoWith("Build complete", "result", buildResult)
@@ -214,22 +248,27 @@ func (b *Builder) Build(options *platform.CreateFunctionBuildOptions) (*platform
 	return buildResult, nil
 }
 
+// GetFunctionPath returns the path to the function
 func (b *Builder) GetFunctionPath() string {
 	return b.options.FunctionConfig.Spec.Build.Path
 }
 
+// GetFunctionName returns the name of the function
 func (b *Builder) GetFunctionName() string {
 	return b.options.FunctionConfig.Meta.Name
 }
 
+// GetFunctionHandler returns the name of the handler
 func (b *Builder) GetFunctionHandler() string {
 	return b.options.FunctionConfig.Spec.Handler
 }
 
+// GetStagingDir returns path to the staging directory
 func (b *Builder) GetStagingDir() string {
 	return b.stagingDir
 }
 
+// GetFunctionDir return path to function directory inside the staging directory
 func (b *Builder) GetFunctionDir() string {
 
 	// if the function directory was passed, just return that. if the function path was passed, return the directory
@@ -241,6 +280,7 @@ func (b *Builder) GetFunctionDir() string {
 	return path.Dir(b.options.FunctionConfig.Spec.Build.Path)
 }
 
+// GetNoBaseImagePull return true if we shouldn't pull base images
 func (b *Builder) GetNoBaseImagePull() bool {
 	return b.options.FunctionConfig.Spec.Build.NoBaseImagesPull
 }
@@ -261,6 +301,7 @@ func (b *Builder) initializeSupportedRuntimes() {
 	b.runtimeInfo["python:3.6"] = runtimeInfo{"py", poundParser, 5}
 	b.runtimeInfo["nodejs"] = runtimeInfo{"js", slashSlashParser, 0}
 	b.runtimeInfo["java"] = runtimeInfo{"java", slashSlashParser, 0}
+	b.runtimeInfo["ruby"] = runtimeInfo{"rb", slashSlashParser, 0}
 	b.runtimeInfo["dotnetcore"] = runtimeInfo{"cs", slashSlashParser, 0}
 }
 
@@ -427,6 +468,17 @@ func (b *Builder) writeFunctionSourceCodeToTempFile(functionSourceCode string) (
 
 func (b *Builder) resolveFunctionPath(functionPath string) (string, error) {
 
+	if b.options.FunctionConfig.Spec.Build.FunctionSourceCode != "" {
+
+		// if user gave function as source code rather than a path - write it to a temporary file
+		functionSourceCodeTempPath, err := b.writeFunctionSourceCodeToTempFile(b.options.FunctionConfig.Spec.Build.FunctionSourceCode)
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to save function code to temporary file")
+		}
+
+		return functionSourceCodeTempPath, nil
+	}
+
 	// function can either be in the path, received inline or an executable via handler
 	if b.options.FunctionConfig.Spec.Build.Path == "" &&
 		b.options.FunctionConfig.Spec.Image == "" {
@@ -483,6 +535,7 @@ func (b *Builder) resolveFunctionPath(functionPath string) (string, error) {
 }
 
 func (b *Builder) decompressFunctionArchive(functionPath string) (string, error) {
+
 	// create a staging directory
 	decompressDir, err := b.mkDirUnderTemp("decompress")
 	if err != nil {
@@ -514,7 +567,7 @@ func (b *Builder) readFunctionConfigFile(functionConfigPath string) error {
 
 	functionConfigFile, err := os.Open(functionConfigPath)
 	if err != nil {
-		return errors.Wrapf(err, "Failed to open function configuraition file: %s", functionConfigFile)
+		return errors.Wrapf(err, "Failed to open function configuraition file: %q", functionConfigFile.Name())
 	}
 
 	defer functionConfigFile.Close() // nolint: errcheck
@@ -704,18 +757,14 @@ func (b *Builder) cleanupTempDir() error {
 func (b *Builder) buildProcessorImage() (string, error) {
 	b.logger.InfoWith("Building processor image")
 
-	processorDockerfilePathInStaging, err := b.createProcessorDockerfile()
-	if err != nil {
-		return "", errors.Wrap(err, "Failed to create processor dockerfile")
-	}
-
-	buildArgs, err := b.runtime.GetBuildArgs()
+	buildArgs, err := b.getBuildArgs()
 	if err != nil {
 		return "", errors.Wrap(err, "Failed to get build args")
 	}
 
-	if b.options.FunctionConfig.Spec.Build.Offline {
-		buildArgs["NUCLIO_BUILD_OFFLINE"] = "true"
+	processorDockerfilePathInStaging, err := b.createProcessorDockerfile()
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to create processor dockerfile")
 	}
 
 	imageName := fmt.Sprintf("%s:%s", b.processorImage.imageName, b.processorImage.imageTag)
@@ -734,21 +783,13 @@ func (b *Builder) buildProcessorImage() (string, error) {
 func (b *Builder) createProcessorDockerfile() (string, error) {
 
 	// get the contents of the processor dockerfile from the runtime
-	processorDockerfileContents := b.runtime.GetProcessorDockerfileContents()
+	processorDockerfileContents, err := b.getRuntimeProcessorDockerfileContents()
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get Dockerfile contents")
+	}
 
 	// generated dockerfile should reside in staging
 	processorDockerfilePathInStaging := filepath.Join(b.stagingDir, "Dockerfile.processor")
-
-	// space out
-	processorDockerfileContents += "\n"
-
-	// add commands to dockerfile
-	for _, buildCommand := range b.options.FunctionConfig.Spec.Build.Commands {
-		processorDockerfileContents += fmt.Sprintf("RUN %s\n", buildCommand)
-	}
-
-	// space out
-	processorDockerfileContents += "\n"
 
 	// log the resulting dockerfile
 	b.logger.DebugWith("Created processor Dockerfile", "contents", processorDockerfileContents)
@@ -872,4 +913,395 @@ func (b *Builder) getRuntimeCommentParser(logger logger.Logger, runtimeName stri
 
 func (b *Builder) getHandlerDir(stagingDir string) string {
 	return path.Join(stagingDir, "handler")
+}
+
+func (b *Builder) getRuntimeProcessorDockerfileContents() (string, error) {
+
+	// gather the processor dockerfile info
+	processorDockerfileInfo, err := b.getProcessorDockerfileInfo()
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get processor Dockerfile info")
+	}
+
+	// gather artifacts
+	artifactDirNameInStaging := "artifacts"
+	artifactsDir := path.Join(b.stagingDir, artifactDirNameInStaging)
+
+	err = b.gatherArtifactsForSingleStageDockerfile(artifactsDir, processorDockerfileInfo)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to gather artifacts for single stage Dockerfile")
+	}
+
+	// get directives
+	directives := b.options.FunctionConfig.Spec.Build.Directives
+
+	// convert commands to directives if commands have values in them (backwards compatibility)
+	if len(b.options.FunctionConfig.Spec.Build.Commands) != 0 {
+		directives, err = b.commandsToDirectives(b.options.FunctionConfig.Spec.Build.Commands)
+
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to convert commands to directives")
+		}
+	}
+
+	// merge directives passed by user with directives passed by runtime
+	directives = b.mergeDirectives(directives, processorDockerfileInfo.Directives)
+
+	// generate single stage dockerfile contents
+	return b.generateSingleStageDockerfileContents(artifactDirNameInStaging,
+		processorDockerfileInfo.BaseImage,
+		processorDockerfileInfo.OnbuildArtifactPaths,
+		processorDockerfileInfo.ImageArtifactPaths,
+		directives,
+		b.platform.GetHealthCheckMode() == platform.HealthCheckModeInternalClient)
+}
+
+func (b *Builder) getProcessorDockerfileInfo() (*runtime.ProcessorDockerfileInfo, error) {
+	versionInfo, err := version.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get version info")
+	}
+
+	// get defaults from the runtime
+	runtimeProcessorDockerfileInfo, err := b.runtime.GetProcessorDockerfileInfo(versionInfo)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get processor Dockerfile info")
+	}
+
+	processorDockerfileInfo := runtime.ProcessorDockerfileInfo{
+		OnbuildArtifactPaths: runtimeProcessorDockerfileInfo.OnbuildArtifactPaths,
+		ImageArtifactPaths:   runtimeProcessorDockerfileInfo.ImageArtifactPaths,
+		Directives:           runtimeProcessorDockerfileInfo.Directives,
+	}
+
+	// set the base image
+	processorDockerfileInfo.BaseImage = b.getProcessorDockerfileBaseImage(runtimeProcessorDockerfileInfo.BaseImage)
+
+	// set the onbuild image
+	processorDockerfileInfo.OnbuildImage, err = b.getProcessorDockerfileOnbuildImage(versionInfo,
+		runtimeProcessorDockerfileInfo.OnbuildImage)
+
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get onbuild image")
+	}
+
+	return &processorDockerfileInfo, nil
+}
+
+func (b *Builder) getProcessorDockerfileBaseImage(runtimeDefaultBaseImage string) string {
+
+	// override base image, if required
+	switch b.options.FunctionConfig.Spec.Build.BaseImage {
+
+	// if user didn't pass anything, use default as specified in Dockerfile
+	case "":
+		return runtimeDefaultBaseImage
+
+	// if user specified something - use that
+	default:
+		return b.options.FunctionConfig.Spec.Build.BaseImage
+	}
+}
+
+func (b *Builder) getProcessorDockerfileOnbuildImage(versionInfo *version.Info,
+	runtimeDefaultOnbuildImage string) (string, error) {
+
+	// if the user supplied an onbuild image, format it with the appropriate tag,
+	if b.options.FunctionConfig.Spec.Build.OnbuildImage != "" {
+		onbuildImageTemplate, err := template.New("onbuildImage").Parse(b.options.FunctionConfig.Spec.Build.OnbuildImage)
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to create onbuildImage template")
+		}
+
+		var onbuildImageTemplateBuffer bytes.Buffer
+		err = onbuildImageTemplate.Execute(&onbuildImageTemplateBuffer, &map[string]interface{}{
+			"Label": versionInfo.Label,
+			"Arch":  versionInfo.Arch,
+		})
+
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to run template")
+		}
+
+		onbuildImage := onbuildImageTemplateBuffer.String()
+
+		b.options.Logger.DebugWith("Using user provided onbuild image",
+			"onbuildImageTemplate", b.options.FunctionConfig.Spec.Build.OnbuildImage,
+			"onbuildImage", onbuildImage)
+
+		return onbuildImage, nil
+	}
+
+	return runtimeDefaultOnbuildImage, nil
+}
+
+func (b *Builder) generateSingleStageDockerfileContents(artifactDirNameInStaging string,
+	baseImage string,
+	onbuildArtifactPaths map[string]string,
+	imageArtifactPaths map[string]string,
+	directives map[string][]functionconfig.Directive,
+	healthCheckRequired bool) (string, error) {
+
+	// now that all artifacts are in the artifacts directory, we can craft a single stage Dockerfile
+	dockerfileTemplateContents := `# From the base image
+FROM {{ .BaseImage -}}
+
+{{ if .PreCopyDirectives }}
+# Run the pre-copy directives
+{{ range $directive := .PreCopyDirectives }}
+{{ $directive.Kind }} {{ $directive.Value }}
+{{ end }}
+{{ end }}
+
+{{ if .HealthcheckRequired }}
+# Copy health checker
+COPY artifacts/uhttpc /usr/local/bin/uhttpc
+
+# Readiness probe
+HEALTHCHECK --interval=1s --timeout=3s CMD /usr/local/bin/uhttpc --url http://127.0.0.1:8082/ready || exit 1
+{{ end }}
+
+# Copy required objects from the suppliers
+{{ range $localArtifactPath, $imageArtifactPath := .OnbuildArtifactPaths }}
+COPY {{ $localArtifactPath }} {{ $imageArtifactPath }}
+{{ end }}
+
+{{ range $localArtifactPath, $imageArtifactPath := .ImageArtifactPaths }}
+COPY {{ $localArtifactPath }} {{ $imageArtifactPath }}
+{{ end }}
+
+# Run the post-copy directives
+{{ range $directive := .PostCopyDirectives }}
+{{ $directive.Kind }} {{ $directive.Value }}
+{{ end }}
+
+# Run processor with configuration and platform configuration
+CMD [ "processor", "--config", "/etc/nuclio/config/processor/processor.yaml", "--platform-config", "/etc/nuclio/config/platform/platform.yaml" ]
+`
+
+	// maps between a _relative_ path in staging to the path in the image
+	relativeOnbuildArtifactPaths := map[string]string{}
+	for localArtifactPath, imageArtifactPath := range onbuildArtifactPaths {
+		relativeArtifactPathInStaging := path.Join(artifactDirNameInStaging, path.Base(localArtifactPath))
+
+		relativeOnbuildArtifactPaths[relativeArtifactPathInStaging] = imageArtifactPath
+	}
+
+	dockerfileTemplate, err := template.New("singleStageDockerfile").
+		Parse(dockerfileTemplateContents)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to create onbuildImage template")
+	}
+
+	var dockerfileTemplateBuffer bytes.Buffer
+	err = dockerfileTemplate.Execute(&dockerfileTemplateBuffer, &map[string]interface{}{
+		"BaseImage":            baseImage,
+		"OnbuildArtifactPaths": relativeOnbuildArtifactPaths,
+		"ImageArtifactPaths":   imageArtifactPaths,
+		"PreCopyDirectives":    directives["preCopy"],
+		"PostCopyDirectives":   directives["postCopy"],
+		"HealthcheckRequired":  healthCheckRequired,
+	})
+
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to run template")
+	}
+
+	dockerfileContents := dockerfileTemplateBuffer.String()
+
+	return dockerfileContents, nil
+}
+
+func (b *Builder) gatherArtifactsForSingleStageDockerfile(artifactsDir string,
+	processorDockerfileInfo *runtime.ProcessorDockerfileInfo) error {
+	buildArgs, err := b.getBuildArgs()
+	if err != nil {
+		return errors.Wrap(err, "Failed to get build args")
+	}
+
+	// create an artifacts directory to which we'll copy all of our stuff
+	if err = os.MkdirAll(artifactsDir, 0755); err != nil {
+		return errors.Wrap(err, "Failed to create artifacts directory")
+	}
+
+	// only pull uhttpc if the platform requires an internal healthcheck client
+	if b.platform.GetHealthCheckMode() == platform.HealthCheckModeInternalClient {
+		if err = b.ensureImagesExist([]string{uhttpcImage}); err != nil {
+			return errors.Wrap(err, "Failed to ensure uhttpc image exists")
+		}
+
+		// to support single stage, we need to extract uhttpc and onbuild artifacts ourselves. this means
+		// running a container from a certain image and then extracting artifacts
+		err = b.dockerClient.CopyObjectsFromImage(uhttpcImage, map[string]string{
+			"/home/nuclio/bin/uhttpc": path.Join(b.stagingDir, "artifacts", "uhttpc"),
+		}, false)
+
+		if err != nil {
+			return errors.Wrap(err, "Failed to copy objects from uhttpc")
+		}
+	}
+
+	// to facilitate good ux, pull images that we're going to need (and log it) before copying
+	// objects from them. this also prevents docker spewing out errors about an image not existing
+	if err = b.ensureImagesExist([]string{processorDockerfileInfo.OnbuildImage}); err != nil {
+		return errors.Wrap(err, "Failed to ensure required images exist")
+	}
+
+	// maps between a path in the onbuild image to a local path in artifacts
+	onbuildArtifactPaths := map[string]string{}
+	for onbuildArtifactPath := range processorDockerfileInfo.OnbuildArtifactPaths {
+		onbuildArtifactPaths[onbuildArtifactPath] = path.Join(artifactsDir, path.Base(onbuildArtifactPath))
+	}
+
+	// build an image to trigger the onbuild stuff. then extract the artifacts
+	err = b.buildFromAndCopyObjectsFromContainer(processorDockerfileInfo.OnbuildImage,
+		onbuildArtifactPaths,
+		buildArgs)
+
+	if err != nil {
+		return errors.Wrap(err, "Failed to copy objects from onbuild")
+	}
+
+	return nil
+}
+
+func (b *Builder) ensureImagesExist(images []string) error {
+	if b.GetNoBaseImagePull() {
+		b.logger.Debug("Skipping base images pull")
+		return nil
+	}
+
+	for _, image := range images {
+		if err := b.dockerClient.PullImage(image); err != nil {
+			return errors.Wrap(err, "Failed to pull image")
+		}
+	}
+
+	return nil
+}
+
+func (b *Builder) getBuildArgs() (map[string]string, error) {
+	versionInfo, err := version.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get version info")
+	}
+
+	buildArgs := map[string]string{}
+
+	if b.options.FunctionConfig.Spec.Build.Offline {
+		buildArgs["NUCLIO_BUILD_OFFLINE"] = "true"
+	}
+
+	// set tag / arch
+	buildArgs["NUCLIO_LABEL"] = versionInfo.Label
+	buildArgs["NUCLIO_ARCH"] = versionInfo.Arch
+
+	// set handler dir
+	buildArgs["NUCLIO_BUILD_LOCAL_HANDLER_DIR"] = "handler"
+
+	return buildArgs, nil
+}
+
+func (b *Builder) buildFromAndCopyObjectsFromContainer(onbuildImage string,
+	artifactPaths map[string]string,
+	buildArgs map[string]string) error {
+
+	dockerfilePath := path.Join(b.stagingDir, "Dockerfile.onbuild")
+
+	// generate a simple Dockerfile from the onbuild image
+	err := ioutil.WriteFile(dockerfilePath, []byte(fmt.Sprintf("FROM %s", onbuildImage)), 0644)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to write onbuild Dockerfile to %s", dockerfilePath)
+	}
+
+	// generate an image name
+	onbuildImageName := fmt.Sprintf("nuclio-onbuild-%s", xid.New().String())
+
+	// trigger a build
+	err = b.dockerClient.Build(&dockerclient.BuildOptions{
+		Image:          onbuildImageName,
+		ContextDir:     b.stagingDir,
+		BuildArgs:      buildArgs,
+		DockerfilePath: dockerfilePath,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Failed to build onbuild image")
+	}
+
+	defer b.dockerClient.RemoveImage(onbuildImageName) // nolint: errcheck
+
+	// now that we have an image, we can copy the artifacts from it
+	return b.dockerClient.CopyObjectsFromImage(onbuildImageName, artifactPaths, false)
+}
+
+func (b *Builder) commandsToDirectives(commands []string) (map[string][]functionconfig.Directive, error) {
+
+	// create directives
+	directives := map[string][]functionconfig.Directive{
+		"preCopy":  {},
+		"postCopy": {},
+	}
+
+	// current directive kind starts with "preCopy". If the user specifies @nuclio.postCopy it switches to that
+	currentDirective := "preCopy"
+
+	// iterate over commands
+	for _, command := range commands {
+		if strings.TrimSpace(command) == "@nuclio.postCopy" {
+			currentDirective = "postCopy"
+			continue
+		}
+
+		// add to proper directive. support only RUN
+		directives[currentDirective] = append(directives[currentDirective], functionconfig.Directive{
+			Kind:  "RUN",
+			Value: command,
+		})
+	}
+
+	return directives, nil
+}
+
+func (b *Builder) mergeDirectives(first map[string][]functionconfig.Directive,
+	second map[string][]functionconfig.Directive) map[string][]functionconfig.Directive {
+
+	keys := []string{"preCopy", "postCopy"}
+	merged := map[string][]functionconfig.Directive{}
+
+	for _, key := range keys {
+
+		// iterate over inputs
+		for _, input := range []map[string][]functionconfig.Directive{
+			first,
+			second,
+		} {
+
+			// add all directives from input into merged
+			merged[key] = append(merged[key], input[key]...)
+		}
+	}
+
+	return merged
+}
+
+func (b *Builder) getSourceCodeFromFilePath() (string, error) {
+
+	// if the file path is after resolving function source code, do nothing
+	if b.options.FunctionConfig.Spec.Build.FunctionSourceCode != "" {
+		return "", errors.New("Function source code already exists")
+	}
+
+	// if the file path extension is of certain binary types, ignore
+	if path.Ext(b.options.FunctionConfig.Spec.Build.Path) == ".jar" {
+		return "", errors.New("Function source code cannot be extracted from this file type")
+	}
+
+	// if user supplied a file containing printable only characters (i.e. not a zip, jar, etc) - copy the contents
+	// to functionSourceCode so that the dashboard may display it
+	functionContents, err := ioutil.ReadFile(b.options.FunctionConfig.Spec.Build.Path)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to read file contents to source code")
+	}
+
+	return string(functionContents), nil
 }

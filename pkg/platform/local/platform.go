@@ -255,9 +255,11 @@ func (p *Platform) DeleteFunction(deleteFunctionOptions *platform.DeleteFunction
 	return nil
 }
 
-// GetDeployRequiresRegistry returns true if a registry is required for deploy, false otherwise
-func (p *Platform) GetDeployRequiresRegistry() bool {
-	return false
+// GetHealthCheckMode returns the healthcheck mode the platform requires
+func (p *Platform) GetHealthCheckMode() platform.HealthCheckMode {
+
+	// The internal client needs to perform the health check
+	return platform.HealthCheckModeInternalClient
 }
 
 // GetName returns the platform name
@@ -352,6 +354,15 @@ func (p *Platform) GetExternalIPAddresses() ([]string, error) {
 
 	// return an empty string to maintain backwards compatibility
 	return []string{""}, nil
+}
+
+// ResolveDefaultNamespace returns the proper default resource namespace, given the current default namespace
+func (p *Platform) ResolveDefaultNamespace(defaultNamespace string) string {
+	if defaultNamespace == "@nuclio.selfNamespace" {
+		return "nuclio"
+	}
+
+	return defaultNamespace
 }
 
 func (p *Platform) getFreeLocalPort() (int, error) {
