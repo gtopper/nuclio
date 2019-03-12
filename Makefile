@@ -96,7 +96,8 @@ GO_BUILD_TOOL = docker run \
 	--workdir $(GO_BUILD_TOOL_WORKDIR) \
 	--env GOOS=$(NUCLIO_OS) \
 	--env GOARCH=$(NUCLIO_ARCH) \
-	golang:1.9.2 \
+	--env GO111MODULE=on \
+	golang:1.12.0 \
 	go build -a \
 	-installsuffix cgo \
 	-ldflags="$(GO_LINK_FLAGS_INJECT_VERSION)"
@@ -273,8 +274,8 @@ IMAGES_TO_PUSH += $(NUCLIO_DOCKER_HANDLER_BUILDER_JAVA_ONBUILD_IMAGE_NAME)
 .PHONY: lint
 lint: ensure-gopath
 	@echo Installing linters...
-	go get -u github.com/pavius/impi/cmd/impi
-	go get -u gopkg.in/alecthomas/gometalinter.v2
+	GO111MODULE=off go get -u github.com/pavius/impi/cmd/impi
+	GO111MODULE=off go get -u gopkg.in/alecthomas/gometalinter.v2
 	@$(GOPATH)/bin/gometalinter.v2 --install
 
 	@echo Verifying imports...

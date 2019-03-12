@@ -34,18 +34,14 @@ RUN npm install -g gulp bower \
 # Build binary stage: builds the dashboard binary
 #
 
-FROM golang:1.10 as build-binary
+FROM golang:1.12 as build-binary
 
 # copy source tree
 WORKDIR /go/src/github.com/nuclio/nuclio
 COPY . .
 
 # build the dashboard
-RUN go get github.com/v3io/v3io-go-http \
-    && go get github.com/nuclio/logger \
-    && go get github.com/nuclio/nuclio-sdk-go \
-    && go get github.com/nuclio/amqp \
-    && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -a -installsuffix cgo -ldflags="-s -w" -o dashboard cmd/dashboard/main.go
+RUN GO111MODULE=on GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -a -installsuffix cgo -ldflags="-s -w" -o dashboard cmd/dashboard/main.go
 
 #
 # Output stage: Creates version file, copies binary and assets to an alpine image
