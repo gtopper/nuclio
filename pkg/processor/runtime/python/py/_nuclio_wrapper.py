@@ -13,17 +13,26 @@
 # limitations under the License.
 
 import argparse
+import datetime
 import json
 import logging
 import re
 import socket
+import sys
 import time
 import traceback
-import sys
 
+import msgpack
 import nuclio_sdk
 import nuclio_sdk.json_encoder
 import nuclio_sdk.logger
+
+
+class TriggerInfo(object):
+
+    def __init__(self, klass='', kind=''):
+        self.klass = klass
+        self.kind = kind
 
 
 class Wrapper(object):
@@ -44,7 +53,8 @@ class Wrapper(object):
 
         # make a writeable file from processor
         self._processor_sock_wfile = self._processor_sock.makefile('w')
-        self._processor_sock_rfile = self._processor_sock.makefile('r')
+        # self._processor_sock_rfile = self._processor_sock.makefile('rb')
+        self._unpacker = msgpack.Unpacker(raw=False, max_buffer_size=10 * 1024 * 1024)
 
         # replace the default output with the process socket
         self._logger.set_handler('default', self._processor_sock_wfile, nuclio_sdk.logger.JSONFormatter())
@@ -62,75 +72,126 @@ class Wrapper(object):
         # indicate that we're ready
         self._write_packet_to_processor('s')
 
+    @staticmethod
+    def _event_from_msgpack(parsed_data):
+        """Decode event encoded as MessagePack by processor"""
+
+        trigger = TriggerInfo(
+            parsed_data['trigger']['class'],
+            parsed_data['trigger']['kind'],
+        )
+
+        # extract content type, needed to decode body
+        content_type = parsed_data['content_type']
+
+        body = nuclio_sdk.Event.decode_body(parsed_data['body'], content_type)
+
+        return nuclio_sdk.Event(body=body,
+                                content_type=content_type,
+                                trigger=trigger,
+                                fields=parsed_data.get('fields'),
+                                headers=parsed_data.get('headers'),
+                                _id=parsed_data['id'],
+                                method=parsed_data['method'],
+                                path=parsed_data['path'],
+                                size=parsed_data['size'],
+                                timestamp=datetime.datetime.utcfromtimestamp(parsed_data['timestamp']),
+                                url=parsed_data['url'],
+                                _type=parsed_data['type'],
+                                type_version=parsed_data['type_version'],
+                                version=parsed_data['version'])
+
     def serve_requests(self, num_requests=None):
         """Read event from socket, send out reply"""
+
+        int_buf = bytearray(4)
+        buf = memoryview(bytearray(4 * 1024 * 1024))
 
         while True:
 
             formatted_exception = None
-            encoded_response = '{}'
 
+            self._processor_sock.recv_into(int_buf, 4)
+            bytes_to_read = int.from_bytes(int_buf, "big")
+            # if not buf:
+            #     break
+            # buf = bytearray(bytesToRead)
+
+            cumulative_bytes_read = 0
+            while cumulative_bytes_read < bytes_to_read:
+                view = buf[cumulative_bytes_read:bytes_to_read]
+                bytes_read = self._processor_sock.recv_into(view, bytes_to_read-cumulative_bytes_read)
+                cumulative_bytes_read += bytes_read
+
+            self._unpacker.feed(buf[:cumulative_bytes_read])
+            # o = next(self._unpacker)
+
+            # buf = bytearray(1024 ** 2)
+            # self._processor_sock.recv_into(buf, 1024 ** 2)
+            # buf = self._processor_sock.recv(1024 ** 2)
+
+            # client disconnect
+            # if not buf:
+                # If socket is done, we can't log
+                # print('Client disconnect')
+                # return
+
+            msg = next(self._unpacker)
+
+            # self._unpacker.feed(buf)
+
+            # for msg in self._unpacker:
             try:
-                line = self._processor_sock_rfile.readline()
-
-                # client disconnect
-                if not line:
-                    # If socket is done, we can't log
-                    print('Client disconnect')
-                    return
-
                 # decode the JSON encoded event
-                event = nuclio_sdk.Event.from_json(line)
+                event = Wrapper._event_from_msgpack(msg)
+
+                # take call time
+                start_time = time.time()
 
                 try:
-
-                    # take call time
-                    start_time = time.time()
-
                     # call the entrypoint
                     entrypoint_output = self._entrypoint(self._context, event)
-
-                    # measure duration
-                    duration = time.time() - start_time
-
-                    self._write_packet_to_processor('m' + json.dumps({'duration': duration}))
-
-                    response = nuclio_sdk.Response.from_entrypoint_output(self._json_encoder.encode,
-                                                                          entrypoint_output)
-
-                    # try to json encode the response
-                    encoded_response = self._json_encoder.encode(response)
-
                 except Exception as err:
                     formatted_exception = \
                         'Exception caught in handler "{0}": {1}'.format(
                             err, traceback.format_exc())
 
+                # measure duration
+                duration = time.time() - start_time
+
+                self._write_packet_to_processor('m' + json.dumps({'duration': duration}))
+
+                response = nuclio_sdk.Response.from_entrypoint_output(self._json_encoder.encode,
+                                                                      entrypoint_output)
+
+                # try to json encode the response
+                encoded_response = self._json_encoder.encode(response)
+
+                # if we have a formatted exception, return it as 500
+                if formatted_exception is not None:
+                    self._logger.warn(formatted_exception)
+
+                    encoded_response = self._json_encoder.encode({
+                        'body': formatted_exception,
+                        'body_encoding': 'text',
+                        'content_type': 'text/plain',
+                        'status_code': 500,
+                    })
+
+                # write to the socket
+                self._write_packet_to_processor('r' + encoded_response)
+
+                # for testing, we can ask wrapper to only read a set number of requests
+                if num_requests is not None and num_requests != 0:
+                    num_requests -= 1
+
+                if num_requests == 0:
+                    break
+
             except Exception as err:
                 formatted_exception = \
                     'Exception caught while serving "{0}": {1}'.format(
                         err, traceback.format_exc())
-
-            # if we have a formatted exception, return it as 500
-            if formatted_exception is not None:
-                self._logger.warn(formatted_exception)
-
-                encoded_response = self._json_encoder.encode({
-                    'body': formatted_exception,
-                    'body_encoding': 'text',
-                    'content_type': 'text/plain',
-                    'status_code': 500,
-                })
-
-            # write to the socket
-            self._write_packet_to_processor('r' + encoded_response)
-
-            # for testing, we can ask wrapper to only read a set number of requests
-            if num_requests is not None and num_requests != 0:
-                num_requests -= 1
-
-            if num_requests == 0:
-                break
 
     def _load_entrypoint_from_handler(self, handler):
         """Load handler function from handler.
@@ -169,6 +230,7 @@ class Wrapper(object):
     def _write_packet_to_processor(self, body):
         self._processor_sock_wfile.write(body + '\n')
         self._processor_sock_wfile.flush()
+
 
 #
 # init
@@ -210,7 +272,6 @@ def parse_args():
 
 
 def run_wrapper():
-
     # parse arguments
     args = parse_args()
 
@@ -244,6 +305,5 @@ def run_wrapper():
 
 
 if __name__ == '__main__':
-
     # run the wrapper
     run_wrapper()

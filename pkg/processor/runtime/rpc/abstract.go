@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/rs/xid"
 	"io"
 	"net"
 	"net/http"
@@ -34,11 +35,11 @@ import (
 
 	"github.com/nuclio/logger"
 	"github.com/nuclio/nuclio-sdk-go"
-	"github.com/rs/xid"
 )
 
 // TODO: Find a better place (both on file system and configuration)
 const (
+	//socketPathTemplate = "/tmp/nuclio-rpc.sock"
 	socketPathTemplate = "/tmp/nuclio-rpc-%s.sock"
 	connectionTimeout  = 2 * time.Minute
 )
@@ -58,7 +59,7 @@ type result struct {
 type AbstractRuntime struct {
 	runtime.AbstractRuntime
 	configuration  *runtime.Configuration
-	eventEncoder   *EventJSONEncoder
+	eventEncoder   EventEncoder
 	wrapperProcess *os.Process
 	resultChan     chan *result
 	functionLogger logger.Logger
@@ -193,6 +194,7 @@ func (r *AbstractRuntime) GetSocketType() SocketType {
 
 // WaitForStart returns whether the runtime supports sending an indication that it started
 func (r *AbstractRuntime) WaitForStart() bool {
+	//return true
 	return false
 }
 
@@ -222,6 +224,7 @@ func (r *AbstractRuntime) startWrapper() error {
 		return errors.Wrap(err, "Can't run wrapper")
 	}
 	r.wrapperProcess = wrapperProcess
+	//address = address
 
 	conn, err := listener.Accept()
 	if err != nil {
@@ -230,11 +233,12 @@ func (r *AbstractRuntime) startWrapper() error {
 
 	r.Logger.Info("Wrapper connected")
 
-	r.eventEncoder = NewEventJSONEncoder(r.Logger, conn)
+	r.eventEncoder = r.runtime.GetEventEncoder(conn)
 	r.resultChan = make(chan *result)
 	go r.wrapperOutputHandler(conn, r.resultChan)
 
 	// wait for start if required to
+	//fmt.Printf("r.runtime.WaitForStart()=%+v\n", r.runtime.WaitForStart())
 	if r.runtime.WaitForStart() {
 		r.Logger.Debug("Waiting for start")
 
@@ -249,6 +253,7 @@ func (r *AbstractRuntime) startWrapper() error {
 // Create a listener on unix domian docker, return listener, path to socket and error
 func (r *AbstractRuntime) createUnixListener() (net.Listener, string, error) {
 	socketPath := fmt.Sprintf(socketPathTemplate, xid.New().String())
+	//socketPath := fmt.Sprintf(socketPathTemplate)
 
 	if common.FileExists(socketPath) {
 		if err := os.Remove(socketPath); err != nil {
