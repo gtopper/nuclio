@@ -44,13 +44,11 @@ func (je *EventMsgPackEncoder) Encode(event nuclio.Event) error {
 		return err
 	}
 
-	//err := msgpack.NewEncoder(je.writer).Encode(nil)
-	//_, err = je.writer.Write([]byte("\n"))
-	//je.logger.Info("Encoding event as msgpack into writer", "event", eventToEncode, "writer", je.writer, "err", err)
 	err = binary.Write(je.writer, binary.BigEndian, int32(je.buf.Len()))
 	if err != nil {
 		return err
 	}
+
 	bs := je.buf.Bytes()
 	_, err = je.writer.Write(bs)
 	return err
