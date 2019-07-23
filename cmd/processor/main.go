@@ -19,8 +19,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"sort"
 
@@ -49,10 +47,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
-	go func() { // for pprof
-		_, _ = fmt.Fprintln(os.Stderr, http.ListenAndServe("localhost:6060", nil))
-	}()
 
 	return processor.Start()
 }
